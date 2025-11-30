@@ -43,7 +43,10 @@ import static java.util.Objects.requireNonNull;
 
 import android.annotation.NonNull;
 import android.app.ActivityManager;
+import android.app.AlarmManager;
+import android.app.AlarmManager.OnAlarmListener;
 import android.app.BroadcastOptions;
+import android.bluetooth.BluetoothAdapter;
 import android.bluetooth.IAdapter;
 import android.bluetooth.IBluetoothCallback;
 import android.bluetooth.IBluetoothManager;
@@ -59,6 +62,7 @@ import android.content.ServiceConnection;
 import android.content.pm.ApplicationInfo;
 import android.content.pm.PackageInfo;
 import android.content.pm.PackageManager;
+import android.database.ContentObserver;
 import android.os.Binder;
 import android.os.Bundle;
 import android.os.Handler;
@@ -78,6 +82,7 @@ import android.sysprop.BluetoothProperties;
 
 import com.android.bluetooth.flags.Flags;
 import com.android.internal.annotations.VisibleForTesting;
+import com.android.modules.utils.HandlerExecutor;
 import com.android.server.bluetooth.airplane.AirplaneModeListener;
 import com.android.server.bluetooth.satellite.SatelliteModeListener;
 
@@ -169,6 +174,9 @@ class BluetoothManagerService {
     // but Airplane mode will affect Bluetooth state at start up
     // and Airplane mode will have higher priority.
     @VisibleForTesting static final int BLUETOOTH_ON_AIRPLANE = 2;
+
+    // Settings.Global.BLUETOOTH_OFF_TIMEOUT
+    private static final String BLUETOOTH_OFF_TIMEOUT = "bluetooth_off_timeout";
 
     // Map of apps registered to keep BLE scanning on.
     private final Map<IBinder, ClientDeathRecipient> mBleApps = new ConcurrentHashMap<>();
@@ -584,6 +592,24 @@ class BluetoothManagerService {
         return true;
     }
 
+    private final OnAlarmListener mBluetoothTimeoutListener = new OnAlarmListener() {
+        @Override
+        public void onAlarm() {
+            try {
+                // Fetch adapter connection state synchronously and assume disconnected on error
+                if (mAdapter == null) return;
+                int adapterConnectionState = mAdapter.getConnectionState();
+
+                if (getState() == BluetoothAdapter.STATE_ON
+                    && adapterConnectionState == BluetoothAdapter.STATE_DISCONNECTED) {
+                    disable(mContext.getAttributionSource().getPackageName(), /*persist*/ true);
+                }
+            } catch (RemoteException e) {
+                Log.e(TAG, "setBluetoothTimeout() failed", e);
+            }
+        }
+    };
+
     private final BroadcastReceiver mReceiver =
             new BroadcastReceiver() {
                 @Override
@@ -614,6 +640,9 @@ class BluetoothManagerService {
                                             ? MESSAGE_RESTORE_USER_SETTING_OFF
                                             : MESSAGE_RESTORE_USER_SETTING_ON);
                         }
+                    } else if (BluetoothAdapter.ACTION_STATE_CHANGED.equals(action)
+                        || BluetoothAdapter.ACTION_CONNECTION_STATE_CHANGED.equals(action)) {
+                        setBluetoothTimeout();
                     } else if (action.equals(Intent.ACTION_SHUTDOWN)) {
                         Log.i(TAG, "Device is shutting down.");
                         mShutdownInProgress = true;
@@ -662,6 +691,8 @@ class BluetoothManagerService {
         }
 
         IntentFilter filter = new IntentFilter();
+        filter.addAction(BluetoothAdapter.ACTION_CONNECTION_STATE_CHANGED);
+        filter.addAction(BluetoothAdapter.ACTION_STATE_CHANGED);
         filter.addAction(Intent.ACTION_SETTING_RESTORED);
         filter.addAction(Intent.ACTION_SHUTDOWN);
         filter.setPriority(IntentFilter.SYSTEM_HIGH_PRIORITY);
@@ -726,6 +757,27 @@ class BluetoothManagerService {
         mDeviceConfigAllowAutoOn =
                 SystemProperties.getBoolean("bluetooth.server.automatic_turn_on", false);
         Log.d(TAG, "AutoOnFeature property=" + mDeviceConfigAllowAutoOn);
+
+        mContentResolver.registerContentObserver(Settings.Global.getUriFor(
+                BLUETOOTH_OFF_TIMEOUT), false,
+            new ContentObserver(null) {
+                @Override
+                public void onChange(boolean selfChange) {
+                    setBluetoothTimeout();
+                }
+            });
+    }
+
+    private void setBluetoothTimeout() {
+        long bluetoothTimeoutMillis = Settings.Global.getLong(mContext.getContentResolver(),
+            BLUETOOTH_OFF_TIMEOUT, 0);
+        AlarmManager alarmManager = mContext.getSystemService(AlarmManager.class);
+        alarmManager.cancel(mBluetoothTimeoutListener);
+        if (bluetoothTimeoutMillis != 0) {
+            final long timeout = SystemClock.elapsedRealtime() + bluetoothTimeoutMillis;
+            alarmManager.setExactAndAllowWhileIdle(AlarmManager.ELAPSED_REALTIME_WAKEUP, timeout,
+                TAG, new HandlerExecutor(mHandler), null, mBluetoothTimeoutListener);
+        }
     }
 
     private Unit onBleScanDisabled() {
